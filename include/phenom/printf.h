@@ -17,6 +17,8 @@
 #ifndef PHENOM_PRINTF_H
 #define PHENOM_PRINTF_H
 
+#include "phenom/defs.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -40,27 +42,36 @@ typedef size_t (*ph_vprintf_named_formatter_func)(
     const struct ph_vprintf_funcs *funcs);
 
 /** Register a named formatter
+ *
+ * The suggested usage is:
+ *
+ * ```
+ * PH_TYPE_FORMATTER_FUNC(myfunc) {
+ *   // available locals are per ph_vprintf_named_formatter_func
+ *   funcs->print(funcs->print_arg, "myfunc", strlen("myfunc"));
+ *   return strlen("myfunc");
+ * }
+ * ```
+ *
+ * This will automatically register your formatting function during
+ * ph_library_init().
  */
 bool ph_vprintf_register(const char *name, void *formatter_arg,
     ph_vprintf_named_formatter_func func);
 
-#ifdef __GNUC__
 #define PH_TYPE_FORMATTER_REGISTER(tname) \
-static __attribute__((constructor)) \
-void ph_vprintf_named_formatter_register_##tname(void) { \
+static void ph_vprintf_named_formatter_register_##tname(void) { \
   ph_vprintf_register(#tname, NULL, \
       ph_vprintf_named_formatter_func_##tname); \
-}
-#else
-#define PH_TYPE_FORMATTER_REGISTER(tname) /* nothing */
-#endif
+} \
+PH_LIBRARY_INIT(ph_vprintf_named_formatter_register_##tname, 0)
 
 #define PH_TYPE_FORMATTER_FUNC(tname) \
-size_t ph_vprintf_named_formatter_func_##tname(void*,void*,void*,\
+size_t ph_vprintf_named_formatter_func_##tname(void*, void*, void*, \
     const struct ph_vprintf_funcs*); \
 PH_TYPE_FORMATTER_REGISTER(tname) \
 size_t ph_vprintf_named_formatter_func_##tname(\
-    CK_CC_UNUSED void *formatter_arg, void *object, void *print_arg,\
+    CK_CC_UNUSED void *formatter_arg, void *object, void *print_arg, \
     const struct ph_vprintf_funcs *funcs)
 
 /** Portable string formatting.

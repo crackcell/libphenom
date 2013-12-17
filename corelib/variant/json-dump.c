@@ -103,8 +103,7 @@ static int dump_string(ph_string_t *str, ph_stream_t *stm, uint32_t flags)
 
     /* handle \, /, ", and control codes */
     length = 2;
-    switch (codepoint)
-    {
+    switch (codepoint) {
       case '\\': text = "\\\\"; break;
       case '\"': text = "\\\""; break;
       case '\b': text = "\\b"; break;
@@ -118,10 +117,7 @@ static int dump_string(ph_string_t *str, ph_stream_t *stm, uint32_t flags)
         if (codepoint < 0x10000) {
           ph_snprintf(seq, sizeof(seq), "\\u%04x", codepoint);
           length = 6;
-        }
-
-        /* not in BMP -> construct a UTF-16 surrogate pair */
-        else {
+        } else { /* not in BMP -> construct a UTF-16 surrogate pair */
           int32_t first, last;
 
           codepoint -= 0x10000;
@@ -172,8 +168,7 @@ static int dump_real(ph_stream_t *stm, double value)
   /* Make sure there's a dot or 'e' in the output. Otherwise
      a real is converted to an integer when decoding */
   if (strchr(buffer, '.') == NULL &&
-      strchr(buffer, 'e') == NULL)
-  {
+      strchr(buffer, 'e') == NULL) {
     if (length + 3 >= size) {
       /* No space to append ".0" */
       return -1;
@@ -194,7 +189,7 @@ static int dump_real(ph_stream_t *stm, double value)
     if (*start == '-')
       start++;
 
-    while(*end == '0')
+    while (*end == '0')
       end++;
 
     if (end != start) {
@@ -384,7 +379,7 @@ ph_result_t ph_json_dump_string(ph_variant_t *var, ph_string_t *str,
   if (!stm) {
     return PH_NOMEM;
   }
-
+  ph_stm_seek(stm, 0, SEEK_END, NULL);
   res = ph_json_dump_stream(var, stm, flags);
 
   ph_stm_close(stm);

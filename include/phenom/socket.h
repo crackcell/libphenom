@@ -1,5 +1,5 @@
 /*
- * Copyright 2013 Facebook, Inc.
+ * Copyright 2013-present Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -31,6 +31,7 @@
 
 #include "phenom/string.h"
 #include "phenom/buffer.h"
+#include "phenom/openssl.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -179,6 +180,10 @@ typedef struct ph_sock ph_sock_t;
 /** The socket object callback function */
 typedef void (*ph_sock_func)(ph_sock_t *sock, ph_iomask_t why, void *data);
 
+/** Called when we complete a handshake */
+typedef void (*ph_sock_openssl_handshake_func)(
+    ph_sock_t *sock, int res);
+
 /** Socket Object
  *
  * A socket object is a higher level representation of an underlying
@@ -226,6 +231,12 @@ struct ph_sock {
   // These are the actual outgoing address endpoints, independent of
   // any proxying that may be employed
   ph_sockaddr_t sockname, peername;
+
+  // If we've switched up to SSL, holds our SSL context
+  SSL *ssl;
+  ph_stream_t *ssl_stream;
+  ph_sock_openssl_handshake_func handshake_cb;
+  ph_bufq_t *sslwbuf;
 };
 
 /** Create a new sock object from a socket descriptor
@@ -242,6 +253,17 @@ ph_sock_t *ph_sock_new_from_socket(ph_socket_t s, const ph_sockaddr_t *sockname,
  * or timed out.  While disabled, none of these conditions will trigger.
  */
 void ph_sock_enable(ph_sock_t *sock, bool enable);
+
+/** Wakeup the socket object
+ *
+ * Queues an PH_IOMASK_WAKEUP to the sock.  This is primarily useful in cases
+ * where some asynchronous processing has completed and you wish to ping the
+ * sock job so that it can consume the results.
+ *
+ * Delegates to ph_job_wakeup() and can fail for the same reasons as that
+ * function.
+ */
+ph_result_t ph_sock_wakeup(ph_sock_t *sock);
 
 /** Release all resources associated with a socket object
  *
@@ -264,7 +286,8 @@ ph_buf_t *ph_sock_read_bytes_exact(ph_sock_t *sock, uint64_t len);
  * Search for the delimiter in the buffer; if found, returns a buffer containing
  * the record and its delimiter text.
  */
-ph_buf_t *ph_sock_read_record(ph_sock_t *sock, const char *delim, uint32_t delim_len);
+ph_buf_t *ph_sock_read_record(ph_sock_t *sock, const char *delim,
+    uint32_t delim_len);
 
 /** Read a CRLF delimited line
  *
@@ -321,7 +344,8 @@ typedef void (*ph_sock_connect_func)(
  * a default value will be used.
  */
 void ph_sock_resolve_and_connect(const char *name, uint16_t port,
-    struct timeval *timeout, int resolver, ph_sock_connect_func func, void *arg);
+    struct timeval *timeout, int resolver, ph_sock_connect_func func,
+    void *arg);
 
 #define PH_SOCK_SHUT_RD   0
 #define PH_SOCK_SHUT_WR   1
@@ -331,6 +355,33 @@ void ph_sock_resolve_and_connect(const char *name, uint16_t port,
 static inline int ph_sock_shutdown(ph_sock_t *sock, int how) {
   return shutdown(sock->job.fd, how);
 }
+
+/** Enable SSL for the sock
+ *
+ * Configures the sock to act as an SSL client or server.
+ *
+ * This will amend the struct to reference SSL variants of the
+ * streams and set the session to act as an SSL client or server,
+ * depending on the value of the `is_client` parameter.
+ *
+ * This puts the socket into a pending connect or accept state;
+ * the socket will work to satisfy this state before dispatching
+ * any further calls to the sock callback function.
+ *
+ * Once the handshake is complete, the dispatcher will call
+ * handshake_cb with the result of the completed SSL_do_handshake()
+ * function call.
+ *
+ * You may use this opportunity to perform additional validation
+ * of the session.
+ *
+ * You must supply the SSL object for use by this function and ensure
+ * that it is correctly configured (certificates and keys loaded, ciphers
+ * selected and so on).
+ */
+void ph_sock_openssl_enable(ph_sock_t *sock, SSL *ssl,
+    bool is_client, ph_sock_openssl_handshake_func handshake_cb);
+
 
 #ifdef __cplusplus
 }

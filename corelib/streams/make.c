@@ -84,6 +84,9 @@ void ph_stm_destroy(ph_stream_t *stm)
 
 bool ph_stm_close(ph_stream_t *stm)
 {
+  if (!ph_stm_flush(stm)) {
+    return false;
+  }
   if (!stm->funcs->close(stm)) {
     errno = ph_stm_errno(stm);
     return false;
@@ -94,7 +97,7 @@ bool ph_stm_close(ph_stream_t *stm)
   return true;
 }
 
-ph_result_t ph_stm_init(void)
+static void stm_init(void)
 {
   int err;
 
@@ -111,9 +114,8 @@ ph_result_t ph_stm_init(void)
   if (err) {
     ph_panic("ph_stm_init: mutexattr ERRORCHECK: `Pe%d", err);
   }
-
-  return PH_OK;
 }
+PH_LIBRARY_INIT_PRI(stm_init, 0, 7)
 
 /* vim:ts=2:sw=2:et:
  */

@@ -1,5 +1,8 @@
 AC_INIT([phenom], [0.1], [], [phenom])
+AC_CONFIG_AUX_DIR([.acaux])
+AC_CONFIG_SRCDIR([LICENSE])
 AC_CANONICAL_TARGET
+AC_LANG(C)
 
 case "$target_os-$target_cpu" in
   solaris*i386)
@@ -25,11 +28,11 @@ dnl thus we do not force this requirement on our clients
 CFLAGS="$CFLAGS -D_LARGEFILE_SOURCE -D_LARGEFILE64_SOURCE -D_FILE_OFFSET_BITS=64"
 
 AM_INIT_AUTOMAKE([dist-bzip2 subdir-objects])
+LT_INIT
 
 AC_PROG_CC
 AC_C_BIGENDIAN
 AC_C_INLINE
-AC_PROG_RANLIB
 
 AM_PROG_CC_C_O
 AM_PROG_AS
@@ -63,28 +66,95 @@ AC_ARG_ENABLE(stack-protector, [
    stack_protect=$enableval
 ])
 
+AC_DEFUN([HAVE_COMPILER_FLAG],[
+  AC_MSG_CHECKING([if compiler supports $2])
+  save_cflags="$CFLAGS"
+  CFLAGS="$CFLAGS $2"
+  AC_COMPILE_IFELSE([AC_LANG_PROGRAM([[]],[[]])],[
+    AC_MSG_RESULT(yes)
+    $1=yes
+  ],[
+    AC_MSG_RESULT(no)
+    $1=no
+  ])
+  CFLAGS="$save_cflags"
+])
+
+ASAN=no
+AC_ARG_ENABLE(address-sanitizer, [
+  --enable-address-sanitizer  Enable ASAN compilation. See
+    https://code.google.com/p/address-sanitizer/wiki/AddressSanitizer
+],[
+   HAVE_COMPILER_FLAG(ASAN, -fsanitize=address)
+])
+
+dnl flags we'll export to the pkg-config file
+PC_CFLAGS=""
+PC_LIBS=""
+
 AC_SEARCH_LIBS([pthread_create], [pthread])
 AC_SEARCH_LIBS([socket], [socket])
 AC_SEARCH_LIBS([clock_gettime], [rt])
+AC_SEARCH_LIBS([inet_pton], [nsl])
 
-AC_PATH_PROG(PKG_CONFIG, pkg-config, false)
+PC_LIBS="$LIBS"
 
-if ! $PKG_CONFIG --exists --print-errors libcares ; then
-  AC_MSG_ERROR([c-ares is required])
-fi
-
-ares_rpath=""
-case "$target_os" in
-  solaris*|darwin*)
+case "$CC" in
+  *clang*)
+    HAVE_CLANG=yes
     ;;
   *)
-    dnl GNU LD specific; Solaris wants s/L/R/ but moving fast for now
-    ares_rpath=`$PKG_CONFIG --libs-only-L libcares | sed -e 's/L/Wl,-rpath=/'`
+    HAVE_CLANG=no
     ;;
 esac
-LIBS="$LIBS `$PKG_CONFIG --libs libcares` $ares_rpath"
-CFLAGS="$CFLAGS `$PKG_CONFIG --cflags libcares`"
-AC_CHECK_FUNCS(ares_init)
+AM_CONDITIONAL(HAVE_CLANG, test "x$HAVE_CLANG" = xyes)
+
+AC_PATH_PROG(PYTHON, python, true)
+AC_PATH_PROG(PKG_CONFIG, pkg-config, false)
+
+if ! $PKG_CONFIG --exists --print-errors openssl ; then
+  AC_MSG_ERROR([openssl is required])
+fi
+
+ares="yes"
+AC_ARG_WITH(cares, [
+  --with-cares   Enable libc-ares DNS resolver support.
+                 Uses pkg-config to determine compilation flags.
+],[
+  ares=$withval
+])
+if test "x$ares" != "xno" ; then
+  if ! $PKG_CONFIG --exists --print-errors libcares ; then
+    AC_MSG_ERROR([libcares requested but not found])
+  fi
+  ares_rpath=""
+  case "$target_os" in
+    solaris*|darwin*)
+      ;;
+    *)
+      dnl GNU LD specific; Solaris wants s/L/R/ but moving fast for now
+      ares_rpath=`$PKG_CONFIG --libs-only-L libcares | sed -e 's/L/Wl,-rpath=/'`
+      ;;
+  esac
+  LIBS="$LIBS `$PKG_CONFIG --libs libcares` $ares_rpath"
+  CFLAGS="$CFLAGS `$PKG_CONFIG --cflags libcares`"
+  AC_CHECK_FUNCS(ares_parse_mx_reply,[
+    AC_DEFINE(PH_HAVE_ARES_MX, 1, [whether ares has mx parsing support])
+  ])
+  AC_DEFINE(PH_HAVE_ARES, 1, [whether we were built with c-ares support])
+fi
+
+CFLAGS="$CFLAGS `$PKG_CONFIG --cflags openssl`"
+LIBS="$LIBS `$PKG_CONFIG --libs openssl`"
+
+case "$target_os" in
+  darwin*)
+    dnl Apple deprecated the use of their OpenSSL headers in 10.7 and up.
+    dnl Pretend we're building for 10.6 and up and the deprecation warnings
+    dnl go away
+    PC_CFLAGS="$PC_CFLAGS -DMAC_OS_X_VERSION_MIN_REQUIRED=MAC_OS_X_VERSION_10_6"
+    ;;
+esac
 
 AC_PATH_PROG(PHP, php, true)
 AC_SUBST(PHP)
@@ -97,14 +167,12 @@ AC_ARG_WITH(gimli, [
    gimli=$withval
 ])
 if test "x$gimli" != "xno" ; then
-  AC_DEFINE([USE_GIMLI], 1, [Use gimli])
-
   prefixes="$gimli /usr/local /usr"
   mylibdir="lib"
   rpath="-R"
   case $target_os-$target_cpu in
     linux-*64)
-      mylibdir=lib64
+      mylibdir="lib64 lib"
       rpath="-Wl,-rpath="
       ;;
     linux*)
@@ -115,27 +183,37 @@ if test "x$gimli" != "xno" ; then
   save_libs="$LIBS"
   save_cppflags="$CPPFLAGS"
   gimli_dir=""
+  AC_MSG_CHECKING([for gimli])
   for dir in $prefixes ; do
-    LDFLAGS="$save_flags $rpath$dir/$mylibdir -L$dir/$mylibdir"
-    LIBS="$save_libs -lgimli"
-    CPPFLAGS="$save_cppflags -I$dir/include"
-    AC_TRY_LINK([
-#include <libgimli.h>
-],[gimli_heartbeat_attach();],
-      [gimli_dir=$dir]
-    )
-    if test -n "$gimli_dir" ; then
-      AC_CHECK_HEADERS(libgimli.h)
-      save_flags="$save_flags $rpath$dir/$mylibdir -L$dir/$mylibdir"
-      save_libs="$save_libs -lgimli"
-      save_cppflags="$save_cppflags -I$dir/include"
-      break
-    fi
+    for ldir in $mylibdir ; do
+      LDFLAGS="$save_flags $rpath$dir/$ldir -L$dir/$ldir"
+      LIBS="$save_libs -lgimli"
+      CPPFLAGS="$save_cppflags -I$dir/include"
+      AC_TRY_LINK([
+        #include <libgimli.h>
+      ],[gimli_heartbeat_attach();],
+        [gimli_dir=$dir]
+      )
+      if test -n "$gimli_dir" ; then
+        AC_CHECK_HEADERS(libgimli.h)
+        save_flags="$save_flags $rpath$dir/$ldir -L$dir/$ldir"
+        save_libs="$save_libs -lgimli"
+        save_cppflags="$save_cppflags -I$dir/include"
+        AC_MSG_RESULT([yes])
+        USE_GIMLI=yes
+        AC_DEFINE([USE_GIMLI], 1, [Use gimli])
+        break
+      fi
+    done
   done
   LDFLAGS="$save_flags"
   LIBS="$save_libs"
   CPPFLAGS="$save_cppflags"
+  if test "xUSE_GIMLI" != xyes ; then
+    AC_MSG_RESULT([no])
+  fi
 fi
+AM_CONDITIONAL(GIMLI, test "x$USE_GIMLI" = xyes)
 
 dnl for comparitive benchmarking
 AC_ARG_ENABLE(libevent-comparison, [
@@ -213,6 +291,7 @@ localeconv \
 pipe2 \
 port_create \
 processor_bind \
+pthread_getname_np \
 pthread_set_name_np \
 pthread_setname_np \
 pthread_setaffinity_np \
@@ -259,14 +338,12 @@ else
   POINTER_PACK_ENABLE="CK_MD_POINTER_PACK_ENABLE"
 fi
 
-dnl flags we'll export to the pkg-config file
-PC_CFLAGS=""
 case "$CPU" in
   X86_64)
-    PC_CFLAGS="-D__x86_64__=1"
+    PC_CFLAGS="$PC_CFLAGS -D__x86_64__=1"
     ;;
   X86)
-    PC_CFLAGS="-D__x86__=1"
+    PC_CFLAGS="$PC_CFLAGS -D__x86__=1"
     ;;
 esac
 CFLAGS="$CFLAGS $PC_CFLAGS"
@@ -299,10 +376,15 @@ if test -n "$GCC" ; then
     -fstrict-aliasing -pipe -Wno-parentheses"
 fi
 AC_SUBST(PC_CFLAGS)
+AC_SUBST(PC_LIBS)
 
-if test -n "$GCC" -a "$stack_protect" == "yes" ; then
-  CFLAGS="$CFLAGS -Wp,-D_FORTIFY_SOURCE=2 -fexceptions \
-    -fstack-protector --param=ssp-buffer-size=4"
+if test "$ASAN" == "yes" ; then
+  CFLAGS="$CFLAGS -fsanitize=address -fno-common"
+else
+  if test -n "$GCC" -a "$stack_protect" == "yes" ; then
+    CFLAGS="$CFLAGS -Wp,-D_FORTIFY_SOURCE=2 -fexceptions \
+      -fstack-protector --param=ssp-buffer-size=4"
+  fi
 fi
 
 dnl CK needs optimization enabled otherwise it breaks.
@@ -324,7 +406,7 @@ if test -n "$GCC" -a "$lenient" == "no" ; then
 fi
 AC_SUBST(IRONMANCFLAGS)
 
-AC_CONFIG_HEADER([include/phenom_build_config.h])
+AC_CONFIG_HEADER([include/phenom_build_config.h include/phenom/feature_test.h])
 AC_CONFIG_FILES([Makefile thirdparty/ck/include/ck_md.h libphenom.pc])
 AC_OUTPUT
 

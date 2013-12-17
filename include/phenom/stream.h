@@ -20,6 +20,7 @@
 #include "phenom/defs.h"
 #include "phenom/string.h"
 #include "phenom/job.h"
+#include <unistd.h> // For SEEK_SET
 
 /**
  * # Streams
@@ -79,6 +80,26 @@ struct ph_stream {
 bool ph_stm_read(ph_stream_t *stm, void *buf,
     uint64_t count, uint64_t *nread);
 
+/** Requests pre-fetching of data into the read buffer
+ *
+ * Signals an intent to read `count` bytes of data. If the read buffer
+ * already contains >= `count` bytes of data, returns true immediately.
+ *
+ * If there is no available buffer space (or the stream is unbuffered),
+ * returns true immediately.
+ *
+ * Otherwise, will attempt to fill the available buffer space.
+ * Returns false if there was an error performing the underlying read, sets
+ * errno accordingly and makes the error code available via ph_stm_errno().
+ *
+ * On a successful read, returns true.
+ *
+ * Note that `count` is only used as a hint as to whether we need to issue
+ * a read call; it doesn't influence how much data we read.  If the buffer
+ * size is smaller than `count`, we can only fill the available buffer size.
+ */
+bool ph_stm_readahead(ph_stream_t *stm, uint64_t count);
+
 /** Writes data from the provided memory buffer
  *
  * Returns false on error. errno is set accordingly, and ph_stm_errno() can
@@ -91,6 +112,15 @@ bool ph_stm_read(ph_stream_t *stm, void *buf,
 bool ph_stm_write(ph_stream_t *stm, const void *buf,
     uint64_t count, uint64_t *nwrote);
 
+/** Writes data via scatter-gather interface
+ *
+ * Returns false on error. errno is set accordingly, and ph_stm_errno() can
+ * also be used to access that value.
+ *
+ * On success, returns true and stores the number of bytes that were written,
+ * which may be less than requested due to constraints on buffer space or
+ * signal interruption, into nwrote.
+ */
 bool ph_stm_writev(ph_stream_t *stm, const struct iovec *iov,
     int iovcnt, uint64_t *nwrote);
 
@@ -124,6 +154,34 @@ bool ph_stm_flush(ph_stream_t *stm);
  * The return value is 0 on success, -1 on error.
  */
 bool ph_stm_seek(ph_stream_t *stm, int64_t delta, int whence, uint64_t *newpos);
+
+/** Seek back to the start of a stream
+ */
+static inline bool ph_stm_rewind(ph_stream_t *stm) {
+  return ph_stm_seek(stm, 0, SEEK_SET, NULL);
+}
+
+/** Read data from src and write to dest
+ *
+ * Reads up to the specified number of bytes from `src` and writes
+ * them to `dest`.  If `num_bytes` is the special value
+ * `PH_STREAM_READ_ALL` then all remaining data from `src` will
+ * be read.
+ *
+ * Returns `true` on success, which is considered to be that no IO
+ * errors except EOF when reading from `src` were encountered, or
+ * `false` otherwise.
+ *
+ * Sets `*nread` to the number of bytes read from `src`, unless
+ * `nread` is NULL.
+ *
+ * Sets `*nwrote` to the number of bytes successfully written to `dest`,
+ * unless `nwrote` is NULL.
+ */
+bool ph_stm_copy(ph_stream_t *src, ph_stream_t *dest,
+    uint64_t num_bytes, uint64_t *nread, uint64_t *nwrote);
+
+#define PH_STREAM_READ_ALL UINT64_MAX
 
 /** Close the stream and release resources
  *

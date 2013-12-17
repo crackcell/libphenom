@@ -1,5 +1,5 @@
 /*
- * Copyright 2013 Facebook, Inc.
+ * Copyright 2013-present Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -32,9 +32,42 @@ static void stack_tests(void)
   // Ensure length is good
   is(10, ph_string_len(&stack1));
 
+  is(ph_string_append_cstr(&stack2, "hello"), PH_OK);
+  is(5, ph_string_len(&stack2));
+  ok(ph_string_equal_cstr(&stack2, "hello"), "grew");
+
   is(ph_string_append_cstr(&stack2, "12345678901234567890"), PH_OK);
-  is(20, ph_string_len(&stack2));
+  is(25, ph_string_len(&stack2));
+  ok(ph_string_equal_cstr(&stack2, "hello12345678901234567890"), "grew");
+
+  PH_STRING_DECLARE_AND_COPY_CSTR(cstr, &stack2);
+  is_string(cstr, "hello12345678901234567890");
+
+  PH_STRING_DECLARE_CSTR_AVOID_COPY(nocopy1, &stack2);
+  is_string(nocopy1, "hello12345678901234567890");
+  ok(nocopy1 != stack1.buf, "copy, because we can't terminate");
+
+  ph_string_t *slice = ph_string_make_slice(&stack2, 0, 5);
+  ok(ph_string_equal_cstr(slice, "hello"), "slice is right");
+  PH_STRING_DECLARE_CSTR_AVOID_COPY(nocopy2, slice);
+  is_string(nocopy2, "hello");
+  ok(nocopy2 != stack2.buf, "copied");
+  ok(ph_string_equal_cstr(&stack2, "hello12345678901234567890"), "didn't break stack2");
+
+  PH_STRING_DECLARE_STACK(stack3, 32);
+  ph_string_append_cstr(&stack3, "woot");
+  PH_STRING_DECLARE_CSTR_AVOID_COPY(nocopy3, &stack3);
+  is_string(nocopy3, "woot");
+  ok(nocopy3 == stack3.buf, "didn't copy");
+
   ph_string_delref(&stack2);
+
+  PH_STRING_DECLARE_STATIC(static1, "lemon cake");
+  ok(ph_string_equal_cstr(&static1, "lemon cake"), "static ok");
+
+  const char *lemon_cake = "lemon cake";
+  PH_STRING_DECLARE_STATIC_CSTR(static2, lemon_cake);
+  ok(ph_string_equal_cstr(&static2, "lemon cake"), "static ok");
 }
 
 
@@ -159,6 +192,14 @@ static void string_stream_tests(void)
   is(r, sizeof(buf));
   is(memcmp(buf, "pend!", 5), 0);
 
+  ok(ph_stm_seek(stm, str->len, SEEK_SET, NULL), "seek SET to length");
+  ok(ph_stm_seek(stm, 0, SEEK_END, &r), "seek to end");
+  ok(!ph_stm_read(stm, buf, sizeof(buf), &r), "can't read off end");
+
+  ph_stm_printf(stm, "add me");
+  ok(ph_string_equal_cstr(str, "hello kitty and append!add me"), "appended ok");
+  ok(!ph_stm_read(stm, buf, sizeof(buf), &r), "can't read off end");
+
   ph_stm_close(stm);
   ph_string_delref(str);
 }
@@ -171,7 +212,7 @@ int main(int argc, char **argv)
   ph_unused_parameter(argv);
 
   ph_library_init();
-  plan_tests(102);
+  plan_tests(122);
 
   mt_misc = ph_memtype_register(&mt_def);
 

@@ -17,7 +17,8 @@
 #include "phenom/dns.h"
 #include "phenom/hashtable.h"
 #include "phenom/log.h"
-#include <ares.h>
+
+#ifdef PH_HAVE_ARES
 #include <ares_dns.h>
 #include <arpa/nameser.h>
 
@@ -38,7 +39,6 @@ struct ph_dns_query {
   } func;
 };
 
-static pthread_once_t done_ares_init = PTHREAD_ONCE_INIT;
 static struct {
   ph_memtype_t chan, query, job, string, aresp;
 } mt;
@@ -51,11 +51,17 @@ static ph_memtype_def_t defs[] = {
 };
 
 static ph_dns_channel_t *default_channel = NULL;
+static void process_ares(ph_job_t *job, ph_iomask_t why, void *data);
+static struct ph_job_def ares_job_template = {
+  process_ares,
+  PH_MEMTYPE_INVALID,
+  NULL
+};
 
 static inline void apply_mask(ph_dns_channel_t *chan, ph_job_t *job,
     ph_iomask_t mask)
 {
-  struct timeval maxtv = {5, 0}, tv, *tvp;
+  struct timeval maxtv = {60, 0}, tv, *tvp;
   tvp = ares_timeout(chan->chan, &maxtv, &tv);
   ph_job_set_nbio_timeout_in(job, mask, *tvp);
 }
@@ -126,7 +132,7 @@ static void sock_state_cb(void *data, ares_socket_t socket_fd,
     ph_job_set_nbio(job, 0, NULL);
     // We're done with this guy, remove it
     ph_ht_del(&chan->sock_map, &socket_fd);
-    ph_mem_free(mt.job, job);
+    ph_job_free(job);
   }
 }
 
@@ -134,25 +140,23 @@ static void sock_state_cb(void *data, ares_socket_t socket_fd,
 static int sock_create_cb(ares_socket_t socket_fd, int type, void *data)
 {
   ph_dns_channel_t *chan = data;
-  ph_job_t *job = ph_mem_alloc(mt.job);
+  ph_job_t *job = ph_job_alloc(&ares_job_template);
 
   ph_unused_parameter(type);
 
   if (!job) {
-    return -1;
+    return ARES_ENOMEM;
   }
 
-  ph_job_init(job);
-  job->callback = process_ares;
   job->data = chan;
   job->fd = socket_fd;
 
   if (ph_ht_set(&chan->sock_map, &socket_fd, &job) != PH_OK) {
     ph_mem_free(mt.job, job);
-    return -1;
+    return ARES_ENOMEM;
   }
 
-  return 0;
+  return ARES_SUCCESS;
 }
 
 static ph_dns_channel_t *create_chan(void)
@@ -210,8 +214,6 @@ static void do_ares_init(void)
 {
   int res = ares_library_init(ARES_LIB_INIT_ALL);
 
-  atexit(do_ares_fini);
-
   if (res) {
     ph_panic("ares_library_init failed: %s", ares_strerror(res));
   }
@@ -223,12 +225,14 @@ static void do_ares_init(void)
   if (!default_channel) {
     ph_panic("failed to create default DNS channel");
   }
+
+  ares_job_template.memtype = mt.job;
 }
+
+PH_LIBRARY_INIT(do_ares_init, do_ares_fini)
 
 ph_dns_channel_t *ph_dns_channel_create(void)
 {
-  pthread_once(&done_ares_init, do_ares_init);
-
   return create_chan();
 }
 
@@ -277,7 +281,7 @@ static struct ph_dns_query_response *make_a_resp(unsigned char *abuf, int alen)
   }
   // this is where we'll stash the name
   name = ((char*)resp) + size;
-  strcpy(name, host->h_name);
+  strcpy(name, host->h_name); // NOLINT(runtime/printf)
 
   resp->num_answers = ancount;
   resp->name = name;
@@ -296,7 +300,8 @@ static struct ph_dns_query_response *make_a_resp(unsigned char *abuf, int alen)
   return resp;
 }
 
-static struct ph_dns_query_response *make_aaaa_resp(unsigned char *abuf, int alen)
+static struct ph_dns_query_response *make_aaaa_resp(unsigned char *abuf,
+    int alen)
 {
   int ancount = DNS_HEADER_ANCOUNT(abuf);
   struct ph_dns_query_response *resp;
@@ -328,7 +333,7 @@ static struct ph_dns_query_response *make_aaaa_resp(unsigned char *abuf, int ale
   }
   // this is where we'll stash the name
   name = ((char*)resp) + size;
-  strcpy(name, host->h_name);
+  strcpy(name, host->h_name); // NOLINT(runtime/printf)
 
   resp->num_answers = ancount;
   resp->name = name;
@@ -338,7 +343,8 @@ static struct ph_dns_query_response *make_aaaa_resp(unsigned char *abuf, int ale
     resp->answer[i].ttl = ttls[i].ttl;
     resp->answer[i].addr.family = AF_INET6;
     resp->answer[i].addr.sa.v6.sin6_family = AF_INET6;
-    memcpy(&resp->answer[i].addr.sa.v6.sin6_addr, &ttls[i].ip6addr, sizeof(ttls[i].ip6addr));
+    memcpy(&resp->answer[i].addr.sa.v6.sin6_addr, &ttls[i].ip6addr,
+        sizeof(ttls[i].ip6addr));
   }
 
   free(ttls);
@@ -358,7 +364,8 @@ static int compare_mx_ent(const void *aptr, const void *bptr)
   return a->priority - b->priority;
 }
 
-static struct ph_dns_query_response *make_srv_resp(unsigned char *abuf, int alen)
+static struct ph_dns_query_response *make_srv_resp(unsigned char *abuf,
+    int alen)
 {
   struct ph_dns_query_response *resp;
   uint32_t size;
@@ -397,6 +404,7 @@ static struct ph_dns_query_response *make_srv_resp(unsigned char *abuf, int alen
   return resp;
 }
 
+#ifdef PH_HAVE_ARES_MX
 static struct ph_dns_query_response *make_mx_resp(unsigned char *abuf, int alen)
 {
   struct ph_dns_query_response *resp;
@@ -433,6 +441,7 @@ static struct ph_dns_query_response *make_mx_resp(unsigned char *abuf, int alen)
 
   return resp;
 }
+#endif
 
 static void result_cb(void *arg, int status, int timeouts,
   unsigned char *abuf, int alen)
@@ -445,12 +454,14 @@ static void result_cb(void *arg, int status, int timeouts,
       q->func.raw(q->arg, status, timeouts, abuf, alen);
       break;
 
+#ifdef PH_HAVE_ARES_MX
     case PH_DNS_QUERY_MX:
       if (status == ARES_SUCCESS) {
         resp = make_mx_resp(abuf, alen);
       }
       q->func.func(q->arg, status, timeouts, abuf, alen, resp);
       break;
+#endif
 
     case PH_DNS_QUERY_A:
       if (status == ARES_SUCCESS) {
@@ -483,9 +494,6 @@ static void result_cb(void *arg, int status, int timeouts,
 static inline ph_dns_channel_t *fixup_chan(ph_dns_channel_t *chan)
 {
   if (!chan) {
-    if (ph_unlikely(default_channel == NULL)) {
-      pthread_once(&done_ares_init, do_ares_init);
-    }
     chan = default_channel;
   }
   return chan;
@@ -552,9 +560,11 @@ void ph_dns_channel_query(
     case PH_DNS_QUERY_SRV:
       type = ns_t_srv;
       break;
+#ifdef PH_HAVE_ARES_MX
     case PH_DNS_QUERY_MX:
       type = ns_t_mx;
       break;
+#endif
     default:
       ph_panic("invalid query type %d", query_type);
   }
@@ -577,7 +587,7 @@ void ph_dns_channel_gethostbyname(
   pthread_mutex_unlock(&chan->chanlock);
 }
 
-
+#endif // PH_HAVE_ARES
 
 /* vim:ts=2:sw=2:et:
  */

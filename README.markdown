@@ -9,6 +9,7 @@ libPhenom is known to compile and pass its test suite on:
 
  * Linux systems with `epoll`
  * OS X
+ * Illumos and Solaris style systems that have `port_create(3C)`.
 
 libPhenom has been known to compile and pass its test suite on these
 systems, but they have not been tried in a little while, so may require
@@ -16,17 +17,18 @@ a little bit of TLC:
 
  * BSDish systems that have the `kqueue(2)` facility, including
    FreeBSD 9.1 and OpenBSD 5.2
- * Illumos and Solaris style systems that have `port_create(3C)`.
 
 libPhenom depends on:
 
+ * `pkg-config` to find dependencies.
  * [c-ares](http://c-ares.haxx.se) for DNS resolution.
-   It expects to find it via `pkg-config`; you need to provide this in
-   order for phenom to build successfully.
  * [Concurrency Kit](http://concurrencykit.org/) for its excellent
    concurrency primitives and key data structures.  We include CK
    with phenom.
- * **autoconf** and **automake** are required to build libPhenom
+ * **OpenSSL** is required; this should be provided by your OS.
+   You will need to install `openssl-devel` or `libssl-dev` or a similarly
+   named package.
+ * **autoconf**, **automake** and **libtool** are required to build libPhenom
 
 libPhenom works best if built with GCC version 4.3 or later, but should
 be able to build with any C99 compiler.

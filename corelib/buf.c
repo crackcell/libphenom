@@ -61,12 +61,12 @@ static struct {
   ph_memtype_t obj, f8k, f16k, f32k, f64k, vsize, queue, queue_ent;
 } mt;
 
-static pthread_once_t once_init = PTHREAD_ONCE_INIT;
-
 static void buffer_init(void)
 {
   ph_memtype_register_block(sizeof(defs)/sizeof(defs[0]), defs, &mt.obj);
 }
+
+PH_LIBRARY_INIT(buffer_init, 0)
 
 PH_TYPE_FORMATTER_FUNC(buf)
 {
@@ -152,7 +152,6 @@ ph_buf_t *ph_buf_new(uint64_t size)
   ph_buf_t *buf;
   uint64_t selected;
 
-  pthread_once(&once_init, buffer_init);
   buf = ph_mem_alloc(mt.obj);
 
   if (!buf) {
@@ -246,7 +245,8 @@ ph_buf_t *ph_buf_slice(ph_buf_t *buf, uint64_t start, uint64_t len)
   return slice;
 }
 
-bool ph_buf_copy_mem(ph_buf_t *dest, void *mem, uint64_t len, uint64_t dest_start)
+bool ph_buf_copy_mem(ph_buf_t *dest, const void *mem, uint64_t len,
+    uint64_t dest_start)
 {
   if (dest_start + len > dest->size) {
     return false;
@@ -348,7 +348,6 @@ ph_bufq_t *ph_bufq_new(uint64_t max_size)
 {
   ph_bufq_t *q;
 
-  pthread_once(&once_init, buffer_init);
   q = ph_mem_alloc(mt.queue);
   if (!q) {
     return NULL;
@@ -365,16 +364,18 @@ ph_bufq_t *ph_bufq_new(uint64_t max_size)
   return q;
 }
 
-ph_result_t ph_bufq_append(ph_bufq_t *q, void *buf, uint64_t len,
+ph_result_t ph_bufq_append(ph_bufq_t *q, const void *buf, uint64_t len,
     uint64_t *added_bytes)
 {
   struct ph_bufq_ent *last, *append;
-  char *cbuf = buf;
-  uint64_t avail, buflen;
+  const char *cbuf = buf;
+  uint64_t avail = 0, buflen;
 
   last = PH_STAILQ_LAST(&q->fifo, ph_bufq_ent, ent);
-  avail = ph_buf_len(last->buf) - last->wpos;
-  avail = MIN(avail, len);
+  if (last) {
+    avail = ph_buf_len(last->buf) - last->wpos;
+    avail = MIN(avail, len);
+  }
 
   // Top-off
   if (avail) {
@@ -397,7 +398,9 @@ ph_result_t ph_bufq_append(ph_bufq_t *q, void *buf, uint64_t len,
 
   if (!append) {
     // Roll back!
-    last->wpos -= avail;
+    if (last && avail) {
+      last->wpos -= avail;
+    }
     return PH_NOMEM;
   }
 
@@ -584,7 +587,6 @@ static uint64_t find_record(ph_bufq_t *q, const char *delim, uint32_t delim_len)
       uint32_t dlen = delim_len - slen;
 
       bstart = ph_buf_mem(next->buf) + next->rpos;
-      len = next->wpos - next->rpos;
 
       if (len < slen) {
         // Not found, nor findable.
@@ -594,8 +596,9 @@ static uint64_t find_record(ph_bufq_t *q, const char *delim, uint32_t delim_len)
         // size.  If our delimiter len is 3, and the delimiter straddles three
         // entries, we won't ever find it.
         // We don't construct such a sequence today, but if we were to allow a
-        // "zero copy" interface where buffers could be directly chained in, this
-        // is something that might come up.  Whoever adds that can solve that.
+        // "zero copy" interface where buffers could be directly chained in,
+        // this is something that might come up.
+        // Whoever adds that can solve that.
         return 0;
       }
 
@@ -613,7 +616,8 @@ static uint64_t find_record(ph_bufq_t *q, const char *delim, uint32_t delim_len)
   return 0;
 }
 
-ph_buf_t *ph_bufq_consume_record(ph_bufq_t *q, const char *delim, uint32_t delim_len)
+ph_buf_t *ph_bufq_consume_record(ph_bufq_t *q, const char *delim,
+    uint32_t delim_len)
 {
   uint64_t len;
 
@@ -625,7 +629,8 @@ ph_buf_t *ph_bufq_consume_record(ph_bufq_t *q, const char *delim, uint32_t delim
   return ph_bufq_consume_bytes(q, len);
 }
 
-ph_buf_t *ph_bufq_peek_record(ph_bufq_t *q, const char *delim, uint32_t delim_len)
+ph_buf_t *ph_bufq_peek_record(ph_bufq_t *q, const char *delim,
+    uint32_t delim_len)
 {
   uint64_t len;
 
@@ -695,11 +700,13 @@ bool ph_bufq_stm_write(ph_bufq_t *q, ph_stream_t *stm, uint64_t *nwrotep)
 bool ph_bufq_stm_read(ph_bufq_t *q, ph_stream_t *stm, uint64_t *nreadp)
 {
   struct ph_bufq_ent *last;
-  uint64_t avail, nread;
+  uint64_t avail = 0, nread;
   bool res;
 
   last = PH_STAILQ_LAST(&q->fifo, ph_bufq_ent, ent);
-  avail = ph_buf_len(last->buf) - last->wpos;
+  if (last) {
+    avail = ph_buf_len(last->buf) - last->wpos;
+  }
 
   if (!avail) {
     last = q_add_new_buf(q, 0);

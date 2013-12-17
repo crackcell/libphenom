@@ -18,25 +18,18 @@
 #include "phenom/timerwheel.h"
 #include "phenom/sysutil.h"
 #include "phenom/memory.h"
-#include "phenom/log.h"
 #include "phenom/counter.h"
 #include "phenom/configuration.h"
-#include "ck_spinlock.h"
-#include "ck_ring.h"
-#include "ck_stack.h"
-#include "ck_backoff.h"
-#include "ck_queue.h"
+#include "phenom/printf.h"
+#include "corelib/job.h"
+#include <ck_stack.h>
+#include <ck_backoff.h>
+#include <ck_queue.h>
 
 #ifdef __linux__
 #include <linux/futex.h>
 #include <asm/unistd.h>
 #include <sys/syscall.h>
-#endif
-
-#ifdef __linux__
-# define USE_FUTEX 1
-#else
-# define USE_COND 1
 #endif
 
 /** Thread pool dispatcher mechanics.
@@ -76,48 +69,13 @@
  * for dispatching work.
  */
 
-struct ph_thread_pool_wait {
-  uint32_t num_waiting;
-  char pad[CK_MD_CACHELINE - sizeof(uint32_t)];
-#ifdef USE_FUTEX
-  int futcounter;
-#elif defined(USE_COND)
-  pthread_mutex_t m;
-  pthread_cond_t c;
-#endif
-};
-
-// Bounded by sizeof(used_rings). The last ring is the
-// contended ring, so this must be 1 less than the number
-// of available bits.  sizeof(used_rings) is in-turn
-// bounded by the number of bits supported by the ffs()
-// intrinsic
-#define MAX_RINGS ((sizeof(intptr_t)*8)-1)
-
-struct ph_thread_pool {
-  struct ph_thread_pool_wait consumer CK_CC_CACHELINE;
-
-  uint32_t max_queue_len;
-
-  ck_ring_t *rings[MAX_RINGS+1];
-  intptr_t used_rings;
-
-  ck_spinlock_t lock CK_CC_CACHELINE;
-  char pad1[CK_MD_CACHELINE - sizeof(ck_spinlock_t)];
-
-  struct ph_thread_pool_wait producer CK_CC_CACHELINE;
-
-  char *name;
-  ph_counter_scope_t *counters;
-  CK_LIST_ENTRY(ph_thread_pool) plink;
-  ph_thread_t **threads;
-
-  uint32_t max_workers;
-  uint32_t num_workers;
-};
+// Holds max wait time for futex or condition waits
+// This value is updated from configuration when we start the
+// threads
+static struct timespec wait_timespec = { 5, 0 };
 
 static CK_LIST_HEAD(plist, ph_thread_pool)
-  pools = CK_LIST_HEAD_INITIALIZER(pools);
+  ph_all_thread_pools = CK_LIST_HEAD_INITIALIZER(ph_all_thread_pools);
 static pthread_mutex_t pool_write_lock = PTHREAD_MUTEX_INITIALIZER;
 static struct {
   ph_memtype_t
@@ -135,12 +93,45 @@ static const char *counter_names[] = {
   "dispatched",     // number of jobs dispatched
   "consumer_sleep", // number of times consumer sleeps
   "producer_sleep", // number of times producer sleeps
+  "num_pending",    // how many outstanding jobs
 };
 #define SLOT_DISP 0
 #define SLOT_CONSUMER_SLEEP 1
 #define SLOT_PRODUCER_SLEEP 2
+#define SLOT_NUM_PENDING    3
 
 extern int _ph_run_loop;
+
+#define MAX_COLLECTORS 128
+static uint8_t next_collector_id = 0;
+static ph_job_collector_func collector_funcs[MAX_COLLECTORS];
+
+ph_result_t ph_job_collector_register(ph_job_collector_func func)
+{
+  uint8_t slot;
+
+  if (next_collector_id >= MAX_COLLECTORS) {
+    return PH_ERR;
+  }
+
+  slot = ck_pr_faa_8(&next_collector_id, 1);
+  if (next_collector_id >= MAX_COLLECTORS) {
+    return PH_ERR;
+  }
+
+  collector_funcs[slot] = func;
+  return PH_OK;
+}
+
+void ph_job_collector_call(ph_thread_t *me)
+{
+  uint8_t i;
+
+  me->refresh_time = true;
+  for (i = 0; i < next_collector_id; i++) {
+    collector_funcs[i](me);
+  }
+}
 
 static void wait_destroy(struct ph_thread_pool_wait *waiter)
 {
@@ -162,18 +153,31 @@ static void wait_init(struct ph_thread_pool_wait *waiter)
 #endif
 }
 
-static void wait_pool(struct ph_thread_pool_wait *waiter)
+#define SECONDS_TO_NS 1000000000LL
+static bool wait_pool(struct ph_thread_pool_wait *waiter)
 {
+  bool woke;
+
   ck_pr_inc_32(&waiter->num_waiting);
 #ifdef USE_FUTEX
-  syscall(SYS_futex, &waiter->futcounter, FUTEX_WAIT,
-      ck_pr_load_int(&waiter->futcounter), NULL, NULL, 0);
+  woke = syscall(SYS_futex, &waiter->futcounter, FUTEX_WAIT,
+      ck_pr_load_int(&waiter->futcounter), &wait_timespec, NULL, 0) == 0;
 #elif defined(USE_COND)
+  struct timeval now;
+  struct timespec ts;
   pthread_mutex_lock(&waiter->m);
-  pthread_cond_wait(&waiter->c, &waiter->m);
+  gettimeofday(&now, NULL);
+  ts.tv_sec = now.tv_sec + wait_timespec.tv_sec;
+  ts.tv_nsec = (now.tv_usec * 1000) + wait_timespec.tv_nsec;
+  if (ts.tv_nsec > SECONDS_TO_NS) {
+    ts.tv_sec++;
+    ts.tv_nsec -= SECONDS_TO_NS;
+  }
+  woke = pthread_cond_timedwait(&waiter->c, &waiter->m, &ts) == 0;
   pthread_mutex_unlock(&waiter->m);
 #endif
   ck_pr_dec_32(&waiter->num_waiting);
+  return woke;
 }
 
 #define should_wake_pool(waiter)  \
@@ -200,7 +204,7 @@ ph_thread_pool_t *ph_thread_pool_by_name(const char *name)
 {
   ph_thread_pool_t *pool;
 
-  CK_LIST_FOREACH(pool, &pools, plink) {
+  CK_LIST_FOREACH(pool, &ph_all_thread_pools, plink) {
     if (!strcmp(name, pool->name)) {
       return pool;
     }
@@ -236,7 +240,7 @@ ph_thread_pool_t *ph_thread_pool_define(
   pool->name = strdup(name);
   pool->max_workers = num_threads;
   pool->max_queue_len = max_queue_len;
-  pool->threads = calloc(num_threads, sizeof(void*));
+  pool->threads = calloc(num_threads, sizeof(*pool->threads));
   pool->counters = ph_counter_scope_define(pool_counter_scope,
       pool->name, 16);
   ph_counter_scope_register_counter_block(
@@ -247,14 +251,14 @@ ph_thread_pool_t *ph_thread_pool_define(
   wait_init(&pool->producer);
   wait_init(&pool->consumer);
 
-  CK_LIST_INSERT_HEAD(&pools, pool, plink);
+  CK_LIST_INSERT_HEAD(&ph_all_thread_pools, pool, plink);
 
   pthread_mutex_unlock(&pool_write_lock);
 
   return pool;
 }
 
-ph_result_t ph_job_pool_init(void)
+static void job_pool_init(void)
 {
   if (ph_memtype_register_block(sizeof(defs) / sizeof(defs[0]),
         defs, &mt.pool) == PH_MEMTYPE_INVALID) {
@@ -262,32 +266,49 @@ ph_result_t ph_job_pool_init(void)
   }
 
   pool_counter_scope = ph_counter_scope_define(NULL, "threadpool", 16);
-
-  return PH_OK;
 }
 
-// Wait for all pools to be torn down
+PH_LIBRARY_INIT_PRI(job_pool_init, 0, 4)
+
+void ph_thread_pool_signal_stop(ph_thread_pool_t *pool)
+{
+  ck_pr_store_int(&pool->stop, 1);
+  if (should_wake_pool(&pool->consumer)) {
+    wake_pool(&pool->consumer);
+  }
+}
+
+void ph_thread_pool_wait_stop(ph_thread_pool_t *pool)
+{
+  uint32_t i;
+  void *res;
+
+  ph_thread_pool_signal_stop(pool);
+
+  while (ck_pr_load_32(&pool->num_workers)) {
+    if (should_wake_pool(&pool->consumer)) {
+      wake_pool(&pool->consumer);
+    }
+    sched_yield();
+  }
+
+  for (i = 0; i < pool->max_workers; i++) {
+    ph_thread_join(pool->threads[i], &res);
+  }
+}
+
+// Wait for all ph_all_thread_pools to be torn down
 void ph_job_pool_shutdown(void)
 {
   ph_thread_pool_t *pool, *tmp;
   uint32_t i;
-  void *res;
 
-  CK_LIST_FOREACH_SAFE(pool, &pools, plink, tmp) {
+  CK_LIST_FOREACH_SAFE(pool, &ph_all_thread_pools, plink, tmp) {
     pthread_mutex_lock(&pool_write_lock);
     CK_LIST_REMOVE(pool, plink);
     pthread_mutex_unlock(&pool_write_lock);
 
-    while (ck_pr_load_32(&pool->num_workers)) {
-      if (should_wake_pool(&pool->consumer)) {
-        wake_pool(&pool->consumer);
-      }
-      sched_yield();
-    }
-
-    for (i = 0; i < pool->max_workers; i++) {
-      ph_thread_join(pool->threads[i], &res);
-    }
+    ph_thread_pool_wait_stop(pool);
 
     for (i = 0; i < MAX_RINGS + 1; i++) {
       if (pool->rings[i]) {
@@ -312,6 +333,7 @@ static inline ph_job_t *pop_job(ph_thread_pool_t *pool,
   ph_job_t *job;
   uint32_t i;
   intptr_t bits;
+  bool woke;
 
   for (;;) {
     // Try the my own bucket first, as this is lowest contention
@@ -335,11 +357,19 @@ static inline ph_job_t *pop_job(ph_thread_pool_t *pool,
 
     // Can't find anything to do, so go to sleep
     ph_counter_block_add(cblock, SLOT_CONSUMER_SLEEP, 1);
-    wait_pool(&pool->consumer);
+    woke = wait_pool(&pool->consumer);
 
     if (!ck_pr_load_int(&_ph_run_loop)) {
       return NULL;
     }
+
+    if (!woke) {
+      ph_job_collector_call(ph_thread_self());
+    }
+
+    // poll to clean up anything we might have been sitting on while waiting for
+    // more jobs or the epoch to advance
+    ph_thread_epoch_poll();
   }
 }
 
@@ -376,6 +406,16 @@ static void init_ring(ph_thread_pool_t *pool, int bucket)
   ck_pr_fence_store();
 }
 
+void ph_job_dispatch_now(ph_job_t *job)
+{
+  ph_thread_t *me = ph_thread_self();
+
+  me->refresh_time = true;
+  ph_thread_epoch_begin();
+  job->callback(job, PH_IOMASK_NONE, job->data);
+  ph_thread_epoch_end();
+}
+
 static void *worker_thread(void *arg)
 {
   ph_thread_pool_t *pool = arg;
@@ -385,19 +425,15 @@ static void *worker_thread(void *arg)
   int my_bucket;
 
   me = ph_thread_self_slow();
-  me->is_worker = true;
-
-  ck_pr_inc_32(&pool->num_workers);
+  me->is_worker = 1 + ck_pr_faa_32(&pool->num_workers, 1);
   ph_thread_set_name(pool->name);
   my_bucket = me->tid < MAX_RINGS ? me->tid : MAX_RINGS;
   if (should_init_ring(pool, my_bucket)) {
     init_ring(pool, my_bucket);
   }
 
-  if (!ph_thread_set_affinity(me, me->tid % ph_num_cores())) {
-    ph_log(PH_LOG_ERR,
-      "failed to set thread %p affinity to CPU %d\n",
-      (void*)me, me->tid);
+  if (!ph_thread_set_affinity_policy(me, pool->config)) {
+    ph_log(PH_LOG_ERR, "failed to set thread %p affinity", (void*)me);
   }
 
   cblock = ph_counter_block_open(pool->counters);
@@ -405,13 +441,20 @@ static void *worker_thread(void *arg)
   while (ph_likely(ck_pr_load_int(&_ph_run_loop))) {
     job = pop_job(pool, cblock, my_bucket);
     if (!job) {
+      if (ph_unlikely(ck_pr_load_int(&pool->stop))) {
+        break;
+      }
+      ph_thread_epoch_poll();
       continue;
     }
+
+    ph_counter_block_add(cblock, SLOT_NUM_PENDING, -1);
 
     me->refresh_time = true;
     ph_thread_epoch_begin();
     job->callback(job, PH_IOMASK_NONE, job->data);
     ph_thread_epoch_end();
+    ph_thread_epoch_poll();
 
     ph_counter_block_add(cblock, SLOT_DISP, 1);
 
@@ -425,11 +468,15 @@ static void *worker_thread(void *arg)
 
   ck_pr_dec_32(&pool->num_workers);
   ph_counter_block_delref(cblock);
+  ph_thread_epoch_poll();
 
+  if (should_wake_pool(&pool->consumer)) {
+    wake_pool(&pool->consumer);
+  }
   return NULL;
 }
 
-static bool start_workers(ph_thread_pool_t *pool)
+bool ph_thread_pool_start_workers(ph_thread_pool_t *pool)
 {
   uint32_t i;
 
@@ -437,6 +484,16 @@ static bool start_workers(ph_thread_pool_t *pool)
   if (pool->num_workers) {
     pthread_mutex_unlock(&pool_write_lock);
     return false;
+  }
+
+  // If we're being used to restart the pool, make sure we're
+  // not set to stop...
+  ck_pr_store_int(&pool->stop, 0);
+
+  if (!pool->config) {
+    char query[512];
+    ph_snprintf(query, sizeof(query), "$.threadpool.%s.affinity", pool->name);
+    pool->config = ph_config_query(query);
   }
 
   for (i = 0; i < pool->max_workers; i++) {
@@ -451,9 +508,15 @@ void _ph_job_pool_start_threads(void)
 {
   ph_thread_pool_t *pool;
 
-  CK_LIST_FOREACH(pool, &pools, plink) {
+  int max_sleep = ph_config_query_int("$.nbio.max_sleep", 5000);
+
+  wait_timespec.tv_sec = max_sleep / 1000;
+  wait_timespec.tv_nsec =
+    (max_sleep - (wait_timespec.tv_sec * 1000)) * 1000000;
+
+  CK_LIST_FOREACH(pool, &ph_all_thread_pools, plink) {
     if (ck_pr_load_32(&pool->num_workers) < pool->max_workers) {
-      start_workers(pool);
+      ph_thread_pool_start_workers(pool);
     }
   }
 }
@@ -461,8 +524,12 @@ void _ph_job_pool_start_threads(void)
 static inline void do_set_pool(ph_job_t *job, ph_thread_t *me)
 {
   ph_thread_pool_t *pool;
+  ph_counter_block_t *cblock;
 
   pool = job->pool;
+
+  cblock = ph_counter_block_open(pool->counters);
+  ph_counter_block_add(cblock, SLOT_NUM_PENDING, 1);
 
   if (ph_unlikely(me->tid >= MAX_RINGS)) {
     ck_spinlock_lock(&pool->lock);
@@ -471,7 +538,7 @@ static inline void do_set_pool(ph_job_t *job, ph_thread_t *me)
     }
     while (!ck_ring_enqueue_spmc(pool->rings[MAX_RINGS], job)) {
       ck_spinlock_unlock(&pool->lock);
-      ph_counter_scope_add(pool->counters, SLOT_PRODUCER_SLEEP, 1);
+      ph_counter_block_add(cblock, SLOT_PRODUCER_SLEEP, 1);
       wait_pool(&pool->producer);
       ck_spinlock_lock(&pool->lock);
     }
@@ -481,7 +548,7 @@ static inline void do_set_pool(ph_job_t *job, ph_thread_t *me)
       init_ring(pool, me->tid);
     }
     while (ph_unlikely(!ck_ring_enqueue_spmc(pool->rings[me->tid], job))) {
-      ph_counter_scope_add(pool->counters, SLOT_PRODUCER_SLEEP, 1);
+      ph_counter_block_add(cblock, SLOT_PRODUCER_SLEEP, 1);
       wait_pool(&pool->producer);
     }
   }
@@ -489,6 +556,8 @@ static inline void do_set_pool(ph_job_t *job, ph_thread_t *me)
   if (should_wake_pool(&pool->consumer)) {
     wake_pool(&pool->consumer);
   }
+
+  ph_counter_block_delref(cblock);
 }
 
 void _ph_job_set_pool_immediate(ph_job_t *job, ph_thread_t *me)
@@ -545,6 +614,12 @@ CK_EPOCH_CONTAINER(ph_job_t, epoch_entry, epoch_entry_to_job)
 static void deferred_job_free(ck_epoch_entry_t *e)
 {
   ph_job_t *job = epoch_entry_to_job(e);
+  struct ph_nbio_emitter *target_emitter = ph_nbio_emitter_for_job(job);
+
+  // emitter can be NULL during TLS teardown
+  if (target_emitter) {
+    ph_timerwheel_remove(&target_emitter->wheel, &job->timer);
+  }
 
   if (job->def->dtor) {
     job->def->dtor(job);
@@ -555,6 +630,11 @@ static void deferred_job_free(ck_epoch_entry_t *e)
 
 void ph_job_free(ph_job_t *job)
 {
+  struct ph_nbio_emitter *target_emitter = ph_nbio_emitter_for_job(job);
+
+  if (timerisset(&job->timer.due)) {
+    ph_timerwheel_disable(&target_emitter->wheel, &job->timer);
+  }
   ph_thread_epoch_defer(&job->epoch_entry, deferred_job_free);
 }
 

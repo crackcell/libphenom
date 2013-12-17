@@ -42,6 +42,7 @@ int main(int argc, char **argv)
   ph_unused_parameter(argc);
   ph_unused_parameter(argv);
 
+  ph_library_init();
   plan_tests(16);
 
   len = ph_snprintf(buf, 10, "12345678901");
@@ -77,7 +78,7 @@ int main(int argc, char **argv)
 
 #define EXPECTED "prefix: PREFIX inside 42 1 suffix: SUFFIX"
   ok(!strcmp(buf, EXPECTED), "got %s", buf);
-  ok(len == (int)strlen(buf), "got len=%d buflen=%d expected=%d",
+  ok(len == (int)strlen(buf), "got len=%d buflen=%zd expected=%zd",
       len, strlen(buf), strlen(EXPECTED));
   ok(len == (int)strlen(EXPECTED), "got len=%d", len);
 

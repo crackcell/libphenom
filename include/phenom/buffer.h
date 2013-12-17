@@ -102,7 +102,8 @@ ph_buf_t *ph_buf_slice(ph_buf_t *buf, uint64_t start, uint64_t len);
 bool ph_buf_copy(ph_buf_t *src, ph_buf_t *dest, uint64_t start, uint64_t len,
     uint64_t dest_start);
 
-bool ph_buf_copy_mem(ph_buf_t *dest, void *mem, uint64_t len, uint64_t dest_start);
+bool ph_buf_copy_mem(ph_buf_t *dest, const void *mem,
+    uint64_t len, uint64_t dest_start);
 
 /** Fills a buffer region with a byte value
  *
@@ -178,7 +179,7 @@ void ph_bufq_free(ph_bufq_t *q);
  * Populates the number of bytes that were consumed in the added_bytes
  * parameter.
  */
-ph_result_t ph_bufq_append(ph_bufq_t *q, void *buf, uint64_t len,
+ph_result_t ph_bufq_append(ph_bufq_t *q, const void *buf, uint64_t len,
     uint64_t *added_bytes);
 
 /** Attempts to de-queue data from a buffer queue
@@ -216,7 +217,8 @@ ph_buf_t *ph_bufq_peek_bytes(ph_bufq_t *q, uint64_t len);
  *
  * The delimiter is included in the returned buffer.
  */
-ph_buf_t *ph_bufq_consume_record(ph_bufq_t *q, const char *delim, uint32_t delim_len);
+ph_buf_t *ph_bufq_consume_record(ph_bufq_t *q, const char *delim,
+    uint32_t delim_len);
 
 /** Attempts to peek at a record from a buffer queue
  *
@@ -229,7 +231,8 @@ ph_buf_t *ph_bufq_consume_record(ph_bufq_t *q, const char *delim, uint32_t delim
  *
  * The delimiter is included in the returned buffer.
  */
-ph_buf_t *ph_bufq_peek_record(ph_bufq_t *q, const char *delim, uint32_t delim_len);
+ph_buf_t *ph_bufq_peek_record(ph_bufq_t *q, const char *delim,
+    uint32_t delim_len);
 
 /** Attempts to consume data data from a queue and write to a stream
  *

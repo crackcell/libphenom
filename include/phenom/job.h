@@ -1,5 +1,5 @@
 /*
- * Copyright 2013 Facebook, Inc.
+ * Copyright 2013-present Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -36,6 +36,90 @@ extern "C" {
  * - Pool. The work is queued to a thread pool and is dispatched as soon as a
  *   worker becomes available.  libPhenom allows multiple pools to be defined to
  *   better partition and prioritize your workload.
+ *
+ * # Affinity
+ *
+ * By default, threads created by ph_thread_pool_define() and threads in the
+ * NBIO pool use an affinity policy that spreads out the threads and binds
+ * them to the CPU cores based on their phenom `tid`.
+ *
+ * Each thread with a phenom TLS segment is assigned a `tid` starting with 0
+ * for the main thread of the process, increasing by 1 for each additional
+ * thread.
+ *
+ * Each thread in a thread pool has a `wid` starting at 1 for the "first"
+ * thread in that pool, increasing by 1 for each additional thread.
+ *
+ * The default affinity selector is based on the `tid` such that a process
+ * that uses libphenom exclusively for its threads maps each thread across
+ * the set of CPU cores.
+ *
+ * In more complex environments, there may be threads created by other
+ * libraries and the overall affinity configuration is made more complex.
+ * To cater for this, you may specify the affinity selection in your phenom
+ * configuration file.
+ *
+ * For the NBIO pool:
+ *
+ * ```
+ * {
+ *   "nbio": {
+ *     "affinity": {
+ *       "base": 0,
+ *       "selector": "tid"
+ *     }
+ *   }
+ * }
+ * ```
+ *
+ * For any other thread pool, for example, the "MYNAME" pool:
+ *
+ * ```
+ * {
+ *   "threadpool": {
+ *     "MYNAME": {
+ *       "affinity": {
+ *         "base": 0,
+ *         "selector": "tid"
+ *       }
+ *     }
+ *   }
+ * }
+ * ```
+ *
+ * The `base` parameter specifies the offset of the first CPU to bind.
+ * The default is CPU `0`.
+ *
+ * Possible values for `selector` are:
+ *
+ * * `tid` - binds to `(base + thr->tid) % cores`
+ * * `wid` - binds to `(base + thr->wid - 1) % cores`
+ * * `none` - does not set CPU affinity
+ * * `[1,2,3]` allows the thread to bind to any CPU in the set
+ *   `[base + 1, base + 2, base + 3]`.  This specifies an affinity mask, so all
+ *   of the threads in this pool will be able to run on any of the CPUs in the
+ *   specified set.  libPhenom currently only supports this form on Linux and
+ *   BSDish systems; other platforms will bind to the first CPU in the set.
+ * * `2` - binds to CPU `base + 2`.  This causes all threads in the pool to
+ *   bind to the specified CPU.
+ *
+ * If you need to bind a `POOL1` to processors 0-3 and `POOL2` to processors
+ * 4-8, you'd set your configuration like this:
+ *
+ * ```
+ * {
+ *   "threadpool": {
+ *     "POOL1": {
+ *       "affinity": { "base": 0, "selector": "wid" },
+ *       "num_threads": 4
+ *     },
+ *     "POOL2": {
+ *       "affinity": { "base": 4, "selector": "wid" },
+ *       "num_threads": 4
+ *     },
+ *   }
+ * }
+ * ```
  */
 
 /* NBIO trigger mask */
@@ -50,6 +134,8 @@ typedef uint8_t ph_iomask_t;
 #define PH_IOMASK_ERR   4
 /* NBIO did not dispatch before timeout was met */
 #define PH_IOMASK_TIME  8
+/* Dispatch triggered by ph_job_wakeup */
+#define PH_IOMASK_WAKEUP 16
 
 struct ph_job;
 typedef struct ph_job ph_job_t;
@@ -60,30 +146,49 @@ typedef void (*ph_job_func_t)(
     void *data
 );
 
+/** Job definition
+ *
+ * Use this to define a template for a job and then use ph_job_alloc() to allocate
+ * and safely dispose of the job via ph_job_free().  The template also allows you
+ * to pre-initialize the callback for the job.
+ */
 struct ph_job_def {
+  // The callback to run when the job is dispatched.
+  // Will be copied to job->callback during ph_job_alloc()
   ph_job_func_t callback;
+  // The memtype to use to allocate the job
   ph_memtype_t memtype;
+  // Function to be called prior to freeing the job
   void (*dtor)(ph_job_t *job);
 };
 
+/** Job
+ * Use either ph_job_alloc() to allocate and initialize, or allocate it yourself
+ * and use ph_job_init() to initialize the fields.
+ */
 struct ph_job {
-  /* data associated with job */
+  // data associated with job
   void *data;
+  // the callback to run when the job is dispatched
   ph_job_func_t callback;
-  /* deferred apply list */
+  // deferred apply list
   PH_STAILQ_ENTRY(ph_job) q_ent;
+  // whether we're in a deferred apply
   bool in_apply;
-
-  /* for PH_RUNCLASS_NBIO, trigger mask */
+  // for PH_RUNCLASS_NBIO, trigger mask */
   ph_iomask_t mask;
+  // use ph_job_get_kmask() to interpret
   int kmask;
-
+  // Hashed over the scheduler threads; two jobs with
+  // the same emitter hash will run serially wrt. each other
+  uint32_t emitter_affinity;
+  // For nbio, the socket we're bound to for IO events
   ph_socket_t fd;
-  struct timeval   timeout;
+  // Holds timeout state
   struct ph_timerwheel_timer timer;
-
+  // When targeting a thread pool, which pool
   ph_thread_pool_t *pool;
-
+  // for SMR
   ck_epoch_entry_t epoch_entry;
   struct ph_job_def *def;
 };
@@ -139,6 +244,14 @@ ph_result_t ph_job_set_nbio_timeout_in(
  * This API may change as it feels a bit klunky
  */
 ph_iomask_t ph_job_get_kmask(ph_job_t *job);
+
+/** Clear a previously scheduled timer
+ */
+ph_result_t ph_job_clear_timer(ph_job_t *job);
+
+/** Dispatch a job immediately in the current context
+ */
+void ph_job_dispatch_now(ph_job_t *job);
 
 /** Configure a job to run at a specific time */
 ph_result_t ph_job_set_timer_at(
@@ -206,6 +319,50 @@ ph_thread_pool_t *ph_thread_pool_define(
  */
 ph_thread_pool_t *ph_thread_pool_by_name(const char *name);
 
+/** Signal that a thread pool should stop its workers
+ *
+ * In some workloads, we want to spawn a pool of threads to process
+ * a bunch of jobs.  The number of jobs has a finite upper bound and
+ * once they are all complete we no longer need to retain the pool.
+ *
+ * You may use ph_thread_pool_signal_stop() to instruct the pool
+ * to shutdown and stop processing further items.  If you need
+ * to synchronize with the shutdown, you may use ph_thread_pool_wait_stop().
+ *
+ * If all workers stop before consuming any pending jobs, then those
+ * pending jobs will remain pending until the pool is re-enabled via
+ * ph_thread_pool_start_workers().
+ */
+void ph_thread_pool_signal_stop(ph_thread_pool_t *pool);
+
+/** Signal and wait for a thread pool to stop its workers
+ *
+ * Calls ph_thread_pool_signal_stop() and then joins with all of the
+ * worker threads, returning only when the pool has no more remaining
+ * workers.
+ *
+ * This function blocks until there are no more workers.
+ *
+ * It is undefined what will happen if you call ph_thread_pool_start_workers()
+ * before ph_thread_pool_wait_stop() completes.
+ */
+void ph_thread_pool_wait_stop(ph_thread_pool_t *pool);
+
+/** Cause a thread pool to spin up its workers
+ *
+ * You almost never need to call this function.  libPhenom will start all
+ * defined thread pools as part of the initialization it performs in
+ * ph_sched_run().
+ *
+ * The only time that you might possibly need to call this function is if
+ * you have called ph_thread_pool_wait_stop() and later want to restart
+ * the pool and spin up its workers.
+ *
+ * It is undefined what will happen if you call ph_thread_pool_start_workers()
+ * before ph_thread_pool_wait_stop() completes.
+ */
+bool ph_thread_pool_start_workers(ph_thread_pool_t *pool);
+
 /**
  * These are accumulated using ph_counter under the covers.
  * This means that the numbers are a snapshot across a number
@@ -219,6 +376,10 @@ struct ph_thread_pool_stats {
   // How many times a producer has been blocked by a full
   // local ring buffer and gone to sleep
   int64_t producer_sleeps;
+  // How many items are pending dispatch; includes items
+  // in the pool rings and threads attempting to enqueue
+  // to the pool
+  int64_t num_pending;
 };
 
 /** Return thread pool counters for a given pool */
@@ -247,6 +408,82 @@ ph_result_t ph_sched_run(void);
  * Can be called from any thread */
 void ph_sched_stop(void);
 
+typedef void (*ph_nbio_affine_func)(intptr_t code, void *arg);
+
+/** Queue an affine function dispatch
+ *
+ * Arranges to call FUNC with the supplied CODE and ARG parameters.
+ * The function will be called in the context of the emitter thread
+ * with the specified emitter_affinity value.
+ *
+ * This is useful in situations where you need to serialize the
+ * execution of FUNC with respect to IO or timer based function
+ * dispatch.
+ *
+ * Affine functions are dispatched in FIFO order with respect
+ * to other affine functions for a given emitter, and are batched together
+ * between IO and timer dispatches for that emitter.
+ *
+ * Note: if your affine function is operating on a job that is scheduled for IO
+ * or timer callbacks, it is possible that that job will be dispatched for IO
+ * or timer callbacks between the time that your affine function is queued and
+ * dispatched.
+ *
+ * The CODE and ARG parameters are passed through to your affine
+ * function callback; their use is entirely up to you.  Note that
+ * the CODE parameter can hold an integer or a pointer value.
+ *
+ * Should you need to pass more than two parameters to the affine
+ * function, you will need to allocate storage to hold the information;
+ * if you do so, you must ensure that the storage is released at the
+ * appropriate time, as the affine function dispatcher does not
+ * know how to release it for you.
+ *
+ * The queue request can fail due to OOM conditions.
+ */
+ph_result_t ph_nbio_queue_affine_func(uint32_t emitter_affinity,
+    ph_nbio_affine_func func, intptr_t code, void *arg);
+
+/** Queue a request to dispatch the job with `PH_IOMASK_WAKEUP`
+ *
+ * The dispatch will happen as soon as the nbio emitter associated
+ * with the job wakes up and processes the request.
+ *
+ * The ph_job_wakeup request can fail due to OOM conditions or
+ * any condition that can cause ph_nbio_queue_affine_func() to fail.
+ *
+ * Note: it is possible that that job will be dispatched for
+ * IO or timer callbacks between the time that ph_job_wakeup() is
+ * called and when the `PH_IOMASK_WAKEUP` is dispatched.
+ */
+ph_result_t ph_job_wakeup(ph_job_t *job);
+
+typedef void (*ph_job_collector_func)(ph_thread_t *me);
+
+/** Register a worker collector callback
+ *
+ * Certain workloads will benefit from aggressive caching or relaxed
+ * cleanup processing while the system is busy.  In order to provide
+ * timely resource reclamation, an application may register one or
+ * more collector callbacks.
+ *
+ * A collector callback is invoked by emitter threads in the NBIO
+ * pool and worker threads in other thread pools when that thread
+ * reaches a quiescent state.  For NBIO threads, this is when a given
+ * emitter thread has not dispatched a job in the past `$.nbio.max_sleep`
+ * milliseconds.  For worker threads, this is when a given thread waits
+ * `$.nbio.max_sleep` without being woken up.  These states are assessed
+ * per thread.  An idle system will trigger a collector once per thread
+ * every `$.nbio.max_sleep` milliseconds while idle.
+ *
+ * The collector callback is invoked in the context of the thread that
+ * is now quiescent and is passed the `ph_thread_t` for that thread.
+ *
+ * The collector callback should ideally restrict itself to cleaning up data
+ * associated with the current thread.
+ */
+ph_result_t ph_job_collector_register(ph_job_collector_func func);
+
 /* ----
  * the following are implementation specific and shouldn't
  * be called except by wizards
@@ -272,13 +509,18 @@ void ph_job_pool_apply_deferred_items(ph_thread_t *me);
  * in milliseconds.  If you enabled Gimli support, libphenom will
  * update the heartbeat after performing the barrier.  This ensures
  * that all worker threads are healthy and making progress.
- * The default value for this `5000` milliseconds; it should be
+ * The default value for this is `5000` milliseconds; it should be
  * more frequent than your Gimli watchdog interval.  You may disable
  * barrier and heartbeat by setting this option to `0`.
+ *
+ * `$.nbio.max_sleep` specifies the maximum duration that an nbio
+ * or worker thread will be idle.  The default value for this is
+ * `5000` milliseconds.  This is important when it comes to handling
+ * deferred memory reclamation; after the max sleep expires, and if
+ * no events are due, the worker will call ph_thread_epoch_poll()
+ * to speculatively reclaim memory.
  */
 ph_result_t ph_nbio_init(uint32_t sched_cores);
-
-ph_result_t ph_job_pool_init(void);
 
 void _ph_job_set_pool_immediate(ph_job_t *job, ph_thread_t *me);
 void _ph_job_pool_start_threads(void);

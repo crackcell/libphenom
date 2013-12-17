@@ -277,6 +277,8 @@ ph_var_unpack(root, &err, 0, "{s?i, s?[ii]}",
  *
  * The query `$.one.two[2]` produces the value `"c"`, while the
  * query `$.one.two[3].lemon` produces the value `"cake"`.
+ *
+ * Use ph_var_jsonpath_get() to issue JSONPath style queries.
  */
 
 #ifndef PHENOM_VARIANT_H
@@ -647,6 +649,8 @@ bool ph_var_equal(ph_variant_t *a, ph_variant_t *b);
  * For each format character (except for `{}[]n`), one argument
  * is consumed and used to build the corresponding value.
  *
+ * See [the section above on Building Values](#variant--Building-Values).
+ *
  * Returns `NULL` on error.
  */
 ph_variant_t *ph_var_pack(ph_var_err_t *error, const char *fmt, ...);
@@ -656,13 +660,16 @@ ph_variant_t *ph_var_pack(ph_var_err_t *error, const char *fmt, ...);
  * For each format character (except for `{}[]n`), one argument
  * is consumed and used to build the corresponding value.
  *
+ * See [the section above on Building Values](#variant--Building-Values).
+ *
  * Returns `NULL` on error.
  */
 ph_variant_t *ph_var_vpack(ph_var_err_t *error, const char *fmt, va_list ap);
 
 /** Parse a variant into native C values
  *
- * See the section above on Parsing and Validating values.
+ * See [the section above on Parsing and Validating values
+ * ](#variant--Parsing-and-Validating-Values).
  *
  * Returns `PH_OK` on success.
  */
@@ -671,7 +678,8 @@ ph_result_t ph_var_unpack(ph_variant_t *root, ph_var_err_t *error,
 
 /** Parse a variant into native C values
  *
- * See the section above on Parsing and Validating values.
+ * See [the section above on Parsing and Validating values
+ * ](#variant--Parsing-and-Validating-Values).
  *
  * Returns `PH_OK` on success.
  */
@@ -680,8 +688,8 @@ ph_result_t ph_var_vunpack(ph_variant_t *root, ph_var_err_t *error,
 
 /** Evaluate a JSONPath style expression.
  *
- * libPhenom supports a limited subset of JSONPath; see the start of this
- * document for more details on the supported syntax.
+ * libPhenom supports a limited subset of JSONPath; see [the start of this
+ * document](#variant--JSONPath-style-queries) for more details on the supported syntax.
  *
  * Returns a borrowed reference on the matching element if found, else
  * returns NULL pointer.

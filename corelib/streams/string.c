@@ -21,7 +21,6 @@ struct string_stream {
   uint32_t pos;
 };
 
-static pthread_once_t var_once = PTHREAD_ONCE_INIT;
 static ph_memtype_t mt_string_stream;
 
 static struct ph_memtype_def def = {
@@ -32,6 +31,7 @@ static void init_string_stream(void)
 {
   mt_string_stream = ph_memtype_register(&def);
 }
+PH_LIBRARY_INIT(init_string_stream, 0)
 
 static bool str_close(ph_stream_t *stm)
 {
@@ -135,7 +135,7 @@ static bool str_seek(ph_stream_t *stm, int64_t delta,
       return false;
   }
 
-  if (off < 0 || off >= ss->str->len) {
+  if (off < 0 || off > ss->str->len) {
     stm->last_err = EINVAL;
     return false;
   }
@@ -163,8 +163,6 @@ ph_stream_t *ph_stm_string_open(ph_string_t *str)
   if (!str) {
     return 0;
   }
-
-  pthread_once(&var_once, init_string_stream);
 
   ss = ph_mem_alloc(mt_string_stream);
   if (!ss) {

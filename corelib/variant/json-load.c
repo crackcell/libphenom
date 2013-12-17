@@ -72,7 +72,6 @@ typedef struct {
 
 #define stream_to_lex(stream) ph_container_of(stream, lex_t, stream)
 
-static pthread_once_t var_once = PTHREAD_ONCE_INIT;
 static ph_memtype_t mt_json;
 static struct ph_memtype_def def = {
   "variant", "json", 0, 0
@@ -118,14 +117,11 @@ static void error_set(ph_var_err_t *error, const lex_t *lex,
           "%s near '`Ps%p'", msg_text, (void*)&lex->saved_text);
       result = msg_with_context;
     }
-  }
-  else
-  {
+  } else {
     if (lex->stream.state == STREAM_STATE_ERROR) {
       /* No context for UTF-8 decoding errors */
       result = msg_text;
-    }
-    else {
+    } else {
       ph_snprintf(msg_with_context, sizeof(msg_with_context),
           "%s near end of file", msg_text);
       result = msg_with_context;
@@ -148,7 +144,7 @@ static void error_set_oom(ph_var_err_t *error, const lex_t *lex)
   if (lex) {
     error_set(error, lex, "out of memory");
   } else {
-    strcpy(error->text, "out of memory");
+    strcpy(error->text, "out of memory"); // NOLINT(runtime/printf)
   }
 }
 
@@ -207,14 +203,10 @@ static int utf8_check_full(const char *buffer, int size)
   if (value > 0x10FFFF) {
     /* not in Unicode range */
     return 0;
-  }
-
-  else if (0xD800 <= value && value <= 0xDFFF) {
+  } else if (0xD800 <= value && value <= 0xDFFF) {
     /* invalid code point (UTF-16 surrogate halves) */
     return 0;
-  }
-
-  else if ((size == 2 && value < 0x80) ||
+  } else if ((size == 2 && value < 0x80) ||
       (size == 3 && value < 0x800) ||
       (size == 4 && value < 0x10000)) {
     /* overlong encoding */
@@ -300,8 +292,7 @@ static void stream_unget(stream_t *stream, int c)
   if (c == '\n') {
     stream->line--;
     stream->column = stream->last_column;
-  }
-  else if (ph_utf8_seq_len(c) > 0) {
+  } else if (ph_utf8_seq_len(c) > 0) {
     stream->column--;
   }
 
@@ -426,14 +417,10 @@ static void lex_scan_string(lex_t *lex, ph_var_err_t *error)
   while (c != '"') {
     if (c == STREAM_STATE_ERROR) {
       goto out;
-    }
-
-    else if (c == STREAM_STATE_EOF) {
+    } else if (c == STREAM_STATE_EOF) {
       error_set(error, lex, "premature end of input");
       goto out;
-    }
-
-    else if (0 <= c && c <= 0x1F) {
+    } else if (0 <= c && c <= 0x1F) {
       /* control character */
       lex_unget_unsave(lex, c);
       if (c == '\n') {
@@ -442,9 +429,7 @@ static void lex_scan_string(lex_t *lex, ph_var_err_t *error)
         error_set(error, lex, "control character 0x%x", c);
       }
       goto out;
-    }
-
-    else if (c == '\\') {
+    } else if (c == '\\') {
       c = lex_get_save(lex, error);
       if (c == 'u') {
         c = lex_get_save(lex, error);
@@ -455,16 +440,14 @@ static void lex_scan_string(lex_t *lex, ph_var_err_t *error)
           }
           c = lex_get_save(lex, error);
         }
-      }
-      else if (c == '"' || c == '\\' || c == '/' || c == 'b' ||
+      } else if (c == '"' || c == '\\' || c == '/' || c == 'b' ||
           c == 'f' || c == 'n' || c == 'r' || c == 't') {
         c = lex_get_save(lex, error);
       } else {
         error_set(error, lex, "invalid escape");
         goto out;
       }
-    }
-    else {
+    } else {
       c = lex_get_save(lex, error);
     }
   }
@@ -513,28 +496,23 @@ static void lex_scan_string(lex_t *lex, ph_var_err_t *error)
                 ((value - 0xD800) << 10) +
                 (value2 - 0xDC00) +
                 0x10000;
-            }
-            else {
+            } else {
               /* invalid second surrogate */
               error_set(error, lex,
                   "invalid Unicode '\\u%04X\\u%04X'",
                   value, value2);
               goto out;
             }
-          }
-          else {
+          } else {
             /* no second surrogate */
             error_set(error, lex, "invalid Unicode '\\u%04X'",
                 value);
             goto out;
           }
-        }
-        else if (0xDC00 <= value && value <= 0xDFFF) {
+        } else if (0xDC00 <= value && value <= 0xDFFF) {
           error_set(error, lex, "invalid Unicode '\\u%04X'", value);
           goto out;
-        }
-        else if (value == 0)
-        {
+        } else if (value == 0) {
           error_set(error, lex, "\\u0000 is not allowed");
           goto out;
         }
@@ -545,9 +523,8 @@ static void lex_scan_string(lex_t *lex, ph_var_err_t *error)
 
         memcpy(t, buffer, length);
         t += length;
-      }
-      else {
-        switch(*p) {
+      } else {
+        switch (*p) {
           case '"': case '\\': case '/':
             *t = *p; break;
           case 'b': *t = '\b'; break;
@@ -561,9 +538,9 @@ static void lex_scan_string(lex_t *lex, ph_var_err_t *error)
         t++;
         p++;
       }
-    }
-    else
+    } else {
       *(t++) = *(p++);
+    }
   }
   *t = '\0';
   lex->token = TOKEN_STRING;
@@ -620,14 +597,12 @@ static int lex_scan_number(lex_t *lex, int c, ph_var_err_t *error)
       lex_unget_unsave(lex, c);
       goto out;
     }
-  }
-  else if (l_isdigit(c)) {
+  } else if (l_isdigit(c)) {
     c = lex_get_save(lex, error);
     while (l_isdigit(c)) {
       c = lex_get_save(lex, error);
     }
-  }
-  else {
+  } else {
     lex_unget_unsave(lex, c);
     goto out;
   }
@@ -672,7 +647,7 @@ static int lex_scan_number(lex_t *lex, int c, ph_var_err_t *error)
     lex_save(lex, c);
 
     c = lex_get_save(lex, error);
-    while(l_isdigit(c))
+    while (l_isdigit(c))
       c = lex_get_save(lex, error);
   }
 
@@ -687,7 +662,7 @@ static int lex_scan_number(lex_t *lex, int c, ph_var_err_t *error)
     }
 
     c = lex_get_save(lex, error);
-    while(l_isdigit(c))
+    while (l_isdigit(c))
       c = lex_get_save(lex, error);
   }
 
@@ -736,19 +711,13 @@ static int lex_scan(lex_t *lex, ph_var_err_t *error)
 
   if (c == '{' || c == '}' || c == '[' || c == ']' || c == ':' || c == ',') {
     lex->token = c;
-  }
-
-  else if (c == '"') {
+  } else if (c == '"') {
     lex_scan_string(lex, error);
-  }
-
-  else if (l_isdigit(c) || c == '-') {
+  } else if (l_isdigit(c) || c == '-') {
     if (lex_scan_number(lex, c, error)) {
       goto out;
     }
-  }
-
-  else if (l_isalpha(c)) {
+  } else if (l_isalpha(c)) {
     /* eat up the whole identifier for clearer error messages */
 
     c = lex_get_save(lex, error);
@@ -766,9 +735,7 @@ static int lex_scan(lex_t *lex, ph_var_err_t *error)
     } else {
       lex->token = TOKEN_INVALID;
     }
-  }
-
-  else {
+  } else {
     /* save the rest of the input UTF-8 sequence to get an error
        message of valid UTF-8 */
     lex_save_cached(lex);
@@ -800,11 +767,10 @@ static void init_json_mem(void)
 {
   mt_json = ph_memtype_register(&def);
 }
+PH_LIBRARY_INIT(init_json_mem, 0)
 
 static int lex_init(lex_t *lex, ph_stream_t *stm)
 {
-  pthread_once(&var_once, init_json_mem);
-
   memset(lex, 0, sizeof(*lex));
   stream_init(&lex->stream, stm);
 
@@ -959,7 +925,7 @@ static ph_variant_t *parse_value(lex_t *lex, size_t flags, ph_var_err_t *error)
   ph_variant_t *json = NULL;
   ph_string_t *str;
 
-  switch(lex->token) {
+  switch (lex->token) {
     case TOKEN_STRING:
       str = ph_string_make_cstr(mt_json, lex->value.string);
       if (str) {
@@ -1103,8 +1069,6 @@ ph_variant_t *ph_var_string_make_cstr(const char *cstr)
   ph_string_t *str;
   ph_variant_t *var;
 
-  pthread_once(&var_once, init_json_mem);
-
   str = ph_string_make_cstr(mt_json, cstr);
   if (!str) {
     return 0;
@@ -1123,8 +1087,6 @@ ph_result_t ph_var_object_set_claim_cstr(ph_variant_t *obj,
 {
   ph_string_t *str;
   ph_result_t res;
-
-  pthread_once(&var_once, init_json_mem);
 
   str = ph_string_make_cstr(mt_json, cstr);
   if (!str) {
